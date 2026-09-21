@@ -6,7 +6,7 @@ Rust with [Ratatui](https://ratatui.rs) and Crossterm.
 It is deliberately simple — it does not try to compete with ranger, lf or yazi.
 It is meant to be a pleasant, Unix-like place to move around a source tree.
 
-[imagen_prev](./docs/images/imagen_prev.png)
+![imagen_prev](./docs/images/imagen_prev.png)
 
 ## Features
 
