@@ -79,6 +79,107 @@ pub struct Clipboard {
     pub is_move: bool,
 }
 
+/// What the fullscreen viewer is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewerKind {
+    /// A readable text document: the viewer scrolls its lines.
+    Text,
+    /// An image on a kitty-capable terminal: the viewer zooms and pans it.
+    Image,
+    /// Anything else (binary, or an image without kitty support): the viewer
+    /// shows metadata plus an explanatory hint.
+    Meta,
+}
+
+/// A file opened fullscreen. Opened with `→`/`Enter` on a file and closed with
+/// `Esc`/`q`/`←` (image zoom-out closes it when back at fit). The viewer never
+/// quits the app.
+#[derive(Debug, Clone)]
+pub struct Viewer {
+    pub kind: ViewerKind,
+    pub path: PathBuf,
+    pub name: String,
+    /// Lines to render: the document for `Text`, metadata for `Meta`, or empty
+    /// for an `Image` (the terminal draws the graphic itself).
+    pub lines: Vec<String>,
+    /// First visible line for text/meta viewers.
+    pub scroll: usize,
+    /// Viewport height in rows, kept in sync by the renderer each frame.
+    pub page: usize,
+    /// Magnification level for images: 1 (fit), 2, 4 or 8.
+    pub zoom: u32,
+    /// Pan offset for images, in eighths of the visible window per axis.
+    pub pan: (i32, i32),
+}
+
+impl Viewer {
+    pub fn new(kind: ViewerKind, path: PathBuf, name: String, lines: Vec<String>) -> Self {
+        Viewer {
+            kind,
+            path,
+            name,
+            lines,
+            scroll: 0,
+            page: 1,
+            zoom: 1,
+            pan: (0, 0),
+        }
+    }
+
+    /// Maximum `scroll` with the current viewport height (last full page).
+    pub fn max_scroll(&self) -> usize {
+        self.lines.len().saturating_sub(self.page.max(1))
+    }
+
+    /// Scroll by `delta` lines (positive = down), clamped to the document.
+    pub fn scroll_by(&mut self, delta: isize) {
+        let max = self.max_scroll() as isize;
+        let next = self.scroll as isize + delta;
+        self.scroll = next.clamp(0, max) as usize;
+    }
+
+    pub fn scroll_top(&mut self) {
+        self.scroll = 0;
+    }
+
+    pub fn scroll_bottom(&mut self) {
+        self.scroll = self.max_scroll();
+    }
+
+    /// Cycle magnification one step up: 1 → 2 → 4 → 8 → 1.
+    pub fn zoom_in(&mut self) {
+        self.zoom = match self.zoom {
+            1 => 2,
+            2 => 4,
+            4 => 8,
+            _ => 1,
+        };
+        self.pan = self.clamp_pan();
+    }
+
+    /// Cycle magnification one step down: 8 → 4 → 2 → 1 → 1.
+    pub fn zoom_out(&mut self) {
+        self.zoom = match self.zoom {
+            8 => 4,
+            4 => 2,
+            2 => 1,
+            _ => 1,
+        };
+        self.pan = self.clamp_pan();
+    }
+
+    /// Shift the image pan by `(dx, dy)` eighths of the visible window.
+    pub fn pan_by(&mut self, dx: i32, dy: i32) {
+        self.pan = (self.pan.0.saturating_add(dx), self.pan.1.saturating_add(dy));
+        self.pan = self.clamp_pan();
+    }
+
+    /// Keep pan within ±8 eighths (a full window of travel in each direction).
+    fn clamp_pan(&self) -> (i32, i32) {
+        (self.pan.0.clamp(-8, 8), self.pan.1.clamp(-8, 8))
+    }
+}
+
 #[derive(Debug)]
 pub struct App {
     /// Directory currently open in the file list.
@@ -101,6 +202,8 @@ pub struct App {
     pub parent_entries: Vec<Entry>,
     /// Tracked kitty image placement for the preview panel.
     pub img: crate::img::ImgState,
+    /// Fullscreen viewer (file opened with `→`/`Enter`), if any.
+    pub viewer: Option<Viewer>,
 }
 
 impl App {
@@ -119,6 +222,7 @@ impl App {
             parent: PathBuf::new(),
             parent_entries: Vec::new(),
             img: crate::img::ImgState::default(),
+            viewer: None,
         };
         app.refresh()?;
         Ok(app)
@@ -200,5 +304,96 @@ impl App {
             n = len - 1;
         }
         self.selected = n as usize;
+    }
+
+    /// Open a new fullscreen viewer for the currently selected file.
+    pub fn open_viewer(&mut self, viewer: Viewer) {
+        self.viewer = Some(viewer);
+    }
+
+    /// Close the fullscreen viewer, returning to the file list.
+    pub fn close_viewer(&mut self) {
+        self.viewer = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn viewer(kind: ViewerKind, lines: Vec<String>) -> Viewer {
+        Viewer::new(kind, PathBuf::from("/tmp/x"), "x".into(), lines)
+    }
+
+    fn text_lines(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("line {i}")).collect()
+    }
+
+    #[test]
+    fn viewer_scroll_clamps_to_document() {
+        let mut v = viewer(ViewerKind::Text, text_lines(20));
+        v.page = 5;
+        assert_eq!(v.max_scroll(), 15);
+        v.scroll_by(-100);
+        assert_eq!(v.scroll, 0);
+        v.scroll_by(100);
+        assert_eq!(v.scroll, 15); // last page fully visible
+        v.scroll_by(1);
+        assert_eq!(v.scroll, 15); // stays clamped
+        v.scroll_top();
+        assert_eq!(v.scroll, 0);
+        v.scroll_bottom();
+        assert_eq!(v.scroll, 15);
+    }
+
+    #[test]
+    fn viewer_scroll_empty_document() {
+        let mut v = viewer(ViewerKind::Text, Vec::new());
+        v.page = 10;
+        assert_eq!(v.max_scroll(), 0);
+        v.scroll_by(50);
+        assert_eq!(v.scroll, 0);
+    }
+
+    #[test]
+    fn viewer_zoom_cycles_1_2_4_8() {
+        let mut v = viewer(ViewerKind::Image, Vec::new());
+        v.zoom_in();
+        assert_eq!(v.zoom, 2);
+        v.zoom_in();
+        assert_eq!(v.zoom, 4);
+        v.zoom_in();
+        assert_eq!(v.zoom, 8);
+        v.zoom_in();
+        assert_eq!(v.zoom, 1); // wraps around
+        v.zoom_out();
+        assert_eq!(v.zoom, 1); // floor
+        v.zoom_out();
+        assert_eq!(v.zoom, 1);
+    }
+
+    #[test]
+    fn viewer_pan_clamps_to_window_travel() {
+        let mut v = viewer(ViewerKind::Image, Vec::new());
+        v.pan_by(100, -100);
+        assert_eq!(v.pan, (8, -8));
+        v.pan_by(-100, 100);
+        assert_eq!(v.pan, (-8, 8));
+        v.pan_by(3, -2);
+        assert_eq!(v.pan, (-5, 6));
+        v.zoom_in();
+        assert_eq!(v.zoom, 2);
+        v.zoom_in();
+        v.zoom_in();
+        assert_eq!(v.zoom, 8);
+    }
+
+    #[test]
+    fn viewer_scroll_with_smaller_page() {
+        let mut v = viewer(ViewerKind::Text, text_lines(3));
+        v.page = 10; // viewport larger than the document
+        assert_eq!(v.max_scroll(), 0);
+        v.scroll_by(5);
+        assert_eq!(v.scroll, 0);
     }
 }

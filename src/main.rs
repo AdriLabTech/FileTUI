@@ -17,7 +17,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::{
-    event, execute,
+    event::{self, DisableMouseCapture, EnableMouseCapture},
+    execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::backend::CrosstermBackend;
@@ -59,6 +60,8 @@ fn main() -> io::Result<()> {
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> io::Result<()> {
     disable_raw_mode()?;
     let mut out = io::stdout();
+    // The viewer may have left mouse capture on; make sure it is off.
+    execute!(out, DisableMouseCapture)?;
     execute!(out, crossterm::cursor::Show)?;
     execute!(out, LeaveAlternateScreen)?;
     out.flush()?;
@@ -80,15 +83,33 @@ fn run(
     };
 
     let tick_rate = Duration::from_millis(100);
+    // Mouse capture is only active while the fullscreen viewer is open, so the
+    // wheel works there but the terminal keeps normal selection the rest of
+    // the time.
+    let mut mouse_capture = false;
+    let mut stdout = io::stdout();
     loop {
         terminal.draw(|f| ui::draw(f, &mut app))?;
 
-        // Place a kitty image preview for the selection right after the frame
-        // is drawn, so the graphic fills the otherwise-empty panel.
+        // Place a kitty image right after the frame is drawn, so the graphic
+        // fills the otherwise-empty area. The fullscreen viewer uses the whole
+        // screen rect; otherwise the preview panel's content area.
         if let Ok(size) = terminal.size() {
             let l = ui::layout(Rect::new(0, 0, size.width, size.height));
             let content = ui::preview_content_area(l.right);
-            let _ = img::sync(&mut app, content);
+            let screen = Rect::new(0, 0, size.width, size.height);
+            let _ = img::sync(&mut app, content, screen);
+        }
+
+        // Toggle mouse capture exactly with the viewer's presence.
+        let want_capture = app.viewer.is_some();
+        if want_capture != mouse_capture {
+            if want_capture {
+                execute!(stdout, EnableMouseCapture)?;
+            } else {
+                execute!(stdout, DisableMouseCapture)?;
+            }
+            mouse_capture = want_capture;
         }
 
         // Exit if event polling fails (e.g. terminal closed).

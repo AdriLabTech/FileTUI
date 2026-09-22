@@ -12,13 +12,19 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::fsops::Entry;
-use crate::state::{App, Dialog, DialogKind};
+use crate::state::{App, Dialog, DialogKind, ViewerKind};
 use crate::{img, preview};
 
 const HIGHLIGHT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    // The fullscreen viewer owns the whole screen while it is open.
+    if app.viewer.is_some() {
+        draw_viewer(f, app);
+        return;
+    }
+
     if app.show_help {
         draw_help(f);
         return;
@@ -43,6 +49,75 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     if app.dialog.is_some() {
         draw_dialog(f, app);
+    }
+}
+
+/// Fullscreen viewer: text/document scrolling, image zoom/pan, or metadata.
+/// The screen is cleared first; image viewers leave the interior empty so the
+/// kitty graphic (placed by `img::sync` right after this frame) shows through.
+fn draw_viewer(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    f.render_widget(Clear, area);
+
+    let Some(viewer) = app.viewer.as_mut() else {
+        return;
+    };
+
+    let hint = match viewer.kind {
+        ViewerKind::Image => "→ zoom  ← unzoom/close  j/k/h/l pan  wheel zoom  Esc close",
+        _ => "j/k/↑↓ scroll  PgUp/PgDn page  g/G ends  wheel scroll  Esc close",
+    };
+
+    let title = format!(
+        "{} - {}",
+        truncate(&viewer.name, area.width.saturating_sub(40) as usize),
+        hint
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" {} ", title),
+            Style::default().fg(HIGHLIGHT).add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Span::styled(
+            format!(" {} ", hint),
+            Style::default().fg(DIM),
+        ));
+
+    let inner = block.inner(area);
+    // Keep the viewport height in sync for page-scrolling.
+    viewer.page = inner.height as usize;
+    viewer.scroll = viewer.scroll.min(viewer.max_scroll());
+
+    match viewer.kind {
+        // The graphic is painted by img::sync; the interior stays empty.
+        // A placement error is surfaced as text instead.
+        ViewerKind::Image if viewer.lines.is_empty() => {
+            if let Some(err) = &app.img.error {
+                let lines = vec![
+                    Line::from(Span::styled(
+                        "Could not render image:",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        truncate(err, inner.width.saturating_sub(2) as usize),
+                        Style::default().fg(Color::Yellow),
+                    )),
+                ];
+                f.render_widget(Paragraph::new(lines).block(block), area);
+                return;
+            }
+            f.render_widget(block, area);
+        }
+        _ => {
+            let scroll = viewer.scroll as u16;
+            let lines: Vec<Line> = viewer
+                .lines
+                .iter()
+                .map(|l| Line::from(Span::styled(l.clone(), Style::default())))
+                .collect();
+            f.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
+        }
     }
 }
 
@@ -363,31 +438,12 @@ fn draw_image_panel(f: &mut Frame, area: Rect, app: &App, entry: &Entry) {
     ));
 
     // Non-kitty terminals can't show the image; fall back to metadata plus a
-    // hint so the user knows why there is no render.
+    // hint (shared with the fullscreen viewer) so the user knows why.
     if !img::kitty_supported() {
-        let mut lines: Vec<Line> = preview::metadata_lines(entry)
+        let lines: Vec<Line> = preview::image_fallback_lines(entry)
             .into_iter()
-            .enumerate()
-            .map(|(i, l)| {
-                let style = if i == 0 {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                Line::from(Span::styled(l, style))
-            })
+            .map(Line::from)
             .collect();
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Image preview needs the Kitty graphics",
-            Style::default().fg(Color::Yellow),
-        )));
-        lines.push(Line::from(Span::styled(
-            "protocol (TERM=xterm-kitty).",
-            Style::default().fg(Color::Yellow),
-        )));
         f.render_widget(
             Paragraph::new(lines)
                 .block(block)
@@ -430,8 +486,18 @@ fn draw_help(f: &mut Frame) {
         "  View",
         "    h                      Toggle this help",
         "    .                      Toggle hidden files",
+        "    Enter or → on a file    Open the fullscreen viewer",
         "    (image selected)        Rendered via the Kitty graphics protocol",
         "    q                      Quit",
+        "",
+        "  Fullscreen viewer",
+        "    Esc / q / Backspace     Close (text viewers: ← too)",
+        "    →                       Zoom in (image)",
+        "    ←                       Zoom out / close at fit (image)",
+        "    j/k/↑↓                  Scroll (text) or pan (image)",
+        "    h/l                     Pan left/right (image)",
+        "    PgUp/PgDn, g/G          Page / jump to top/bottom (text)",
+        "    mouse wheel             Scroll (text) or zoom (image)",
         "",
         "  Operations",
         "    n                      Create directory",
