@@ -39,20 +39,52 @@ fn is_real_png(path: &Path) -> io::Result<bool> {
     Ok(n == 8 && magic == PNG_MAGIC)
 }
 
-/// Build the payload sent for `path`: a real PNG keeps its original bytes,
-/// everything else is decoded and re-encoded as PNG. The returned format code
-/// is always [`FMT_PNG`]. This is what makes every image extension render
-/// identically: the terminal only ever decodes PNG.
-fn payload_for(path: &Path) -> io::Result<(Vec<u8>, u8)> {
-    if is_real_png(path)? {
-        return Ok((std::fs::read(path)?, FMT_PNG));
-    }
-    let img =
-        image::open(path).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    let mut png = Vec::new();
-    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+/// Estimated on-screen cell size in pixels. kitty/wezterm default fonts land
+/// around 10px wide × 20px tall. Used to pick the transmit budget: we send at
+/// least this resolution per cell so the terminal scales the image *down*
+/// (sharp) instead of up (blurry), without transmitting more than needed.
+const CELL_W_PX: u32 = 10;
+const CELL_H_PX: u32 = 20;
+
+/// The display budget (in pixels) for a cell area. Images bigger than this are
+/// downscaled before transmission; smaller ones keep their native size.
+fn area_budget(area: Rect) -> (u32, u32) {
+    (
+        area.width as u32 * CELL_W_PX,
+        area.height as u32 * CELL_H_PX,
+    )
+}
+
+/// Read just the header dimensions of `path` (no full decode).
+fn header_dimensions(path: &Path) -> io::Result<(u32, u32)> {
+    let reader = image::ImageReader::open(path)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+        .with_guessed_format()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    Ok((png, FMT_PNG))
+    reader
+        .into_dimensions()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+}
+
+/// Downscale `img` to `(target_w, target_h)` when needed and PNG-encode it.
+/// The result carries the same dims as the updated `Placed` struct would use.
+fn encode_png(img: &image::RgbaImage, target_w: u32, target_h: u32) -> io::Result<Vec<u8>> {
+    let (w, h) = img.dimensions();
+    let scaled = if (target_w, target_h) != (w, h) && target_w > 0 && target_h > 0 {
+        image::imageops::resize(
+            img,
+            target_w,
+            target_h,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        img.clone()
+    };
+    let mut png = Vec::new();
+    scaled
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok(png)
 }
 
 /// Whether `path` has a previewable image extension.
@@ -253,7 +285,10 @@ fn sync_preview(app: &mut App, content: Rect, supported: bool) -> io::Result<()>
     }
 
     let had_placement = app.img.key.is_some();
-    app.img.clear();
+    // Drop the placement bookkeeping but keep the decoded cache: navigating
+    // between image files reuses the decode instead of re-reading big files.
+    app.img.key = None;
+    app.img.error = None;
     if had_placement && supported {
         delete_all()?;
     }
@@ -265,7 +300,7 @@ fn sync_preview(app: &mut App, content: Rect, supported: bool) -> io::Result<()>
         return Ok(());
     }
 
-    match place_image(&path, content) {
+    match place_image(&mut app.img.cache, &path, content) {
         Ok(()) => {
             app.img.key = Some(PlaceKey::Preview {
                 path,
@@ -292,33 +327,61 @@ fn delete_all() -> io::Result<()> {
     out.flush()
 }
 
-/// Decode the picture's dimensions, fit it into the area (cells, half-block
-/// model) and transmit it to the terminal.
-fn place_image(path: &Path, area: Rect) -> io::Result<()> {
-    let reader = image::ImageReader::open(path)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
-        .with_guessed_format()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    let (w_px, h_px) = reader
-        .into_dimensions()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+/// Decode `path`, fit it into the area (cells, half-block model) and transmit
+/// it to the terminal.
+///
+/// A real PNG that fits the budget is streamed verbatim (fast, lossless).
+/// Anything else — or anything bigger than the area's pixel budget — is
+/// decoded (through the shared mtime cache) and re-encoded as PNG, downscaled
+/// first so a huge photo never turns into a giant payload that stalls the
+/// frame loop.
+fn place_image(cache: &mut Option<DecodedCache>, path: &Path, area: Rect) -> io::Result<()> {
+    let (w_px, h_px) = header_dimensions(path)?;
+    let (cap_w, cap_h) = area_budget(area);
+    let (out_w, out_h) = downscale_target(w_px, h_px, cap_w, cap_h);
+    if out_w == 0 || out_h == 0 {
+        return Err(io::Error::other("cannot size image for preview"));
+    }
 
-    let (cols, rows) = fit_cells(w_px, h_px, area.width as u32, area.height as u32);
+    // Fast path: an already-small real PNG keeps its original bytes.
+    if is_real_png(path)? && (out_w, out_h) == (w_px, h_px) {
+        let data = std::fs::read(path)?;
+        let (cols, rows) = fit_cells(out_w, out_h, area.width as u32, area.height as u32);
+        if cols == 0 || rows == 0 {
+            return Err(io::Error::other("preview area too small"));
+        }
+        return transmit(
+            &data,
+            Placed {
+                format: FMT_PNG,
+                w_px: out_w,
+                h_px: out_h,
+                cols,
+                rows,
+            },
+            area.x,
+            area.y,
+        );
+    }
+
+    // Everything else: decode (shared cache), downscale to the budget and
+    // re-encode as PNG so the terminal always receives the one universal
+    // format, at a size cheap to transmit.
+    ensure_cache(cache, path)?;
+    let Some(decoded) = cache else {
+        return Err(io::Error::other("image cache missing"));
+    };
+    let data = encode_png(&decoded.img, out_w, out_h)?;
+    let (cols, rows) = fit_cells(out_w, out_h, area.width as u32, area.height as u32);
     if cols == 0 || rows == 0 {
         return Err(io::Error::other("preview area too small"));
     }
-
-    // A real PNG keeps its original bytes; every other extension is decoded
-    // and re-encoded. The payload is always PNG (`f=100`), never a raw RGB
-    // stream (`f=24`), so every kitty-speaking terminal can decode it.
-    let (data, format) = payload_for(path)?;
-
     transmit(
         &data,
         Placed {
-            format,
-            w_px,
-            h_px,
+            format: FMT_PNG,
+            w_px: out_w,
+            h_px: out_h,
             cols,
             rows,
         },
@@ -407,7 +470,11 @@ fn place_fullscreen(
     let (x, y, w, h) = visible_window(cache.img.width(), cache.img.height(), zoom, pan);
     let crop = image::imageops::crop_imm(&cache.img, x, y, w, h).to_image();
 
-    let (out_w, out_h) = downscale_target(w, h, screen.width as u32 * 4, screen.height as u32 * 4);
+    // Budget in physical pixels: each cell is ~10x20 px on screen, so sending
+    // at that resolution keeps the image sharp (the terminal scales down to
+    // the cell grid instead of upscaling a tiny payload = blur).
+    let (cap_w, cap_h) = area_budget(screen);
+    let (out_w, out_h) = downscale_target(w, h, cap_w, cap_h);
     let scaled = if (out_w, out_h) != (w, h) {
         image::imageops::resize(&crop, out_w, out_h, image::imageops::FilterType::Triangle)
     } else {
@@ -685,24 +752,67 @@ mod tests {
             ("a.bmp", image::ImageFormat::Bmp),
         ] {
             let path = temp_image(&dir, name, fmt);
-            let (payload, format) = payload_for(&path).unwrap();
-            assert_eq!(format, FMT_PNG);
-            // Whatever the input extension, the wire format is PNG bytes.
-            assert_eq!(&payload[..8], &PNG_MAGIC);
+            let img = image::open(&path).unwrap().to_rgba8();
+            let png = encode_png(&img, img.width(), img.height()).unwrap();
+            assert_eq!(&png[..8], &PNG_MAGIC);
         }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn png_streams_original_bytes() {
-        let dir = test_dir("png-streams-original-bytes");
+    fn encode_png_downscales_to_target() {
+        let dir = test_dir("encode-png-downscales");
 
-        let path = temp_image(&dir, "keep.png", image::ImageFormat::Png);
-        let original = std::fs::read(&path).unwrap();
-        let (payload, format) = payload_for(&path).unwrap();
-        assert_eq!(format, FMT_PNG);
-        assert_eq!(payload, original);
+        let path = temp_image(&dir, "big.jpg", image::ImageFormat::Jpeg);
+        let img = image::open(&path).unwrap().to_rgba8();
+        assert_eq!((img.width(), img.height()), (8, 6));
+
+        // Target smaller than source -> payload is honest PNG at that size.
+        let png = encode_png(&img, 4, 3).unwrap();
+        let decoded = image::load_from_memory(&png).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (4, 3));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn area_budget_scales_with_cells() {
+        let area = Rect::new(0, 0, 78, 22);
+        assert_eq!(area_budget(area), (780, 440));
+    }
+
+    #[test]
+    fn non_png_preview_is_downscaled_to_budget() {
+        // A 2000x1500 JPEG in a small preview area must come out bounded by
+        // the area budget (and stay proportional), so the transmission never
+        // stalls on a full-size re-encode.
+        let dir = test_dir("non-png-budget");
+        let big = dir.join("photo.jpg");
+        let img = image::RgbImage::from_pixel(2000, 1500, image::Rgb([10, 20, 30]));
+        img.save_with_format(&big, image::ImageFormat::Jpeg)
+            .unwrap();
+
+        let (w_px, h_px) = header_dimensions(&big).unwrap();
+        let (cap_w, cap_h) = area_budget(Rect::new(0, 0, 40, 10));
+        let (out_w, out_h) = downscale_target(w_px, h_px, cap_w, cap_h);
+        assert!(out_w <= cap_w && out_h <= cap_h);
+        assert!(out_w > 0 && out_h > 0);
+        assert!(((out_w as f64) / (out_h as f64) - 2000.0 / 1500.0).abs() < 0.05);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn small_real_png_keeps_preview_native() {
+        let dir = test_dir("small-png-native");
+        let png = temp_image(&dir, "small.png", image::ImageFormat::Png);
+
+        let (w_px, h_px) = header_dimensions(&png).unwrap();
+        let (cap_w, cap_h) = area_budget(Rect::new(0, 0, 80, 24));
+        let (out_w, out_h) = downscale_target(w_px, h_px, cap_w, cap_h);
+        // Within a big budget a small PNG is not touched.
+        assert_eq!((out_w, out_h), (w_px, h_px));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

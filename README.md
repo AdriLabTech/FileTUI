@@ -21,9 +21,10 @@ It is meant to be a pleasant, Unix-like place to move around a source tree.
   [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/)
   on kitty/wezterm terminals (detected via `TERM`, `TERM_PROGRAM` or
   `KITTY_WINDOW_ID`). Other terminals show metadata plus a hint.
-  Real PNGs stream as-is; JPEG/GIF/BMP/WebP/TIFF/ICO are decoded and
-  re-encoded to PNG (`f=100`), the only portable kitty format, so every
-  extension renders identically.
+  Real PNGs stream as-is when they fit; JPEG/GIF/BMP/WebP/TIFF/ICO are
+  decoded, downscaled to the area's on-screen resolution and re-encoded to
+  PNG (`f=100`), the only portable kitty format — so every extension renders
+  identically and sharp without ever shipping a giant payload.
 - **Fullscreen viewer**: `Enter` or `→` on a file opens it fullscreen. Text
   scrolls, images zoom (`→`) and pan (`j/k/h/l` or the wheel), binary files
   show metadata. Close with `Esc`, `q` or `Backspace`.
