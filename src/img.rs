@@ -19,9 +19,40 @@ pub const IMAGE_EXT: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "ico",
 ];
 
-/// Extensions the terminal can decode natively (kitty `f=100` autodetect).
-fn kitty_native(ext: &str) -> bool {
-    matches!(ext, "png" | "jpg" | "jpeg" | "gif")
+/// Kitty format code for PNG payloads. The protocol only guarantees three
+/// formats (`f=24` raw RGB, `f=32` raw RGBA, `f=100` PNG); PNG is the only
+/// compressed/portable one, so every payload we transmit is PNG data.
+const FMT_PNG: u8 = 100;
+
+/// The 8 bytes every real PNG file starts with (magic/signature).
+const PNG_MAGIC: [u8; 8] = *b"\x89PNG\r\n\x1a\n";
+
+/// Whether the file at `path` is genuinely a PNG, sniffed by its magic bytes
+/// (the extension alone can lie). Real PNGs are streamed as-is; any other
+/// format is decoded and re-encoded to PNG so the terminal always receives
+/// the one universal representation.
+fn is_real_png(path: &Path) -> io::Result<bool> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut magic = [0u8; 8];
+    let n = f.read(&mut magic)?;
+    Ok(n == 8 && magic == PNG_MAGIC)
+}
+
+/// Build the payload sent for `path`: a real PNG keeps its original bytes,
+/// everything else is decoded and re-encoded as PNG. The returned format code
+/// is always [`FMT_PNG`]. This is what makes every image extension render
+/// identically: the terminal only ever decodes PNG.
+fn payload_for(path: &Path) -> io::Result<(Vec<u8>, u8)> {
+    if is_real_png(path)? {
+        return Ok((std::fs::read(path)?, FMT_PNG));
+    }
+    let img =
+        image::open(path).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut png = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok((png, FMT_PNG))
 }
 
 /// Whether `path` has a previewable image extension.
@@ -277,24 +308,10 @@ fn place_image(path: &Path, area: Rect) -> io::Result<()> {
         return Err(io::Error::other("preview area too small"));
     }
 
-    // Let kitty autodetect the format (`f=100`) for natively supported files
-    // (streams the original bytes). Everything else is decoded and re-encoded
-    // to PNG (`f=24`) so the terminal always receives something it can show.
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default();
-    let (data, format) = if kitty_native(&ext) {
-        (std::fs::read(path)?, 100)
-    } else {
-        let img = image::open(path)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        let mut png = Vec::new();
-        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        (png, 24)
-    };
+    // A real PNG keeps its original bytes; every other extension is decoded
+    // and re-encoded. The payload is always PNG (`f=100`), never a raw RGB
+    // stream (`f=24`), so every kitty-speaking terminal can decode it.
+    let (data, format) = payload_for(path)?;
 
     transmit(
         &data,
@@ -410,7 +427,7 @@ fn place_fullscreen(
     transmit(
         &png,
         Placed {
-            format: 24,
+            format: FMT_PNG,
             w_px: out_w,
             h_px: out_h,
             cols,
@@ -620,5 +637,73 @@ mod tests {
             visible_window(2000, 1000, 2, (-999, 0)),
             (0, 250, 1000, 500)
         );
+    }
+
+    /// A private temp dir per test (tests run in parallel, so each one needs
+    /// its own location; removing a shared dir would break the others).
+    fn test_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("filetui-test-{}-{}", std::process::id(), name));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write a tiny `w x h` image in the given format to a unique temp path.
+    fn temp_image(dir: &std::path::Path, name: &str, fmt: image::ImageFormat) -> PathBuf {
+        let img = image::RgbImage::from_pixel(8, 6, image::Rgb([10, 20, 30]));
+        let path = dir.join(name);
+        img.save_with_format(&path, fmt).unwrap();
+        path
+    }
+
+    #[test]
+    fn is_real_png_sniffs_magic_bytes() {
+        let dir = test_dir("is-real-png");
+
+        let png = temp_image(&dir, "real.png", image::ImageFormat::Png);
+        let jpg = temp_image(&dir, "real.jpg", image::ImageFormat::Jpeg);
+        assert!(is_real_png(&png).unwrap());
+        // The extension lies: a JPEG named .png is not a real PNG.
+        assert!(!is_real_png(&jpg).unwrap());
+
+        let non_img = dir.join("notes.txt");
+        std::fs::write(&non_img, b"not an image at all").unwrap();
+        assert!(!is_real_png(&non_img).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn payload_is_always_png() {
+        let dir = test_dir("payload-is-always-png");
+
+        for (name, fmt) in [
+            ("a.png", image::ImageFormat::Png),
+            ("a.jpg", image::ImageFormat::Jpeg),
+            ("a.gif", image::ImageFormat::Gif),
+            ("a.webp", image::ImageFormat::WebP),
+            ("a.bmp", image::ImageFormat::Bmp),
+        ] {
+            let path = temp_image(&dir, name, fmt);
+            let (payload, format) = payload_for(&path).unwrap();
+            assert_eq!(format, FMT_PNG);
+            // Whatever the input extension, the wire format is PNG bytes.
+            assert_eq!(&payload[..8], &PNG_MAGIC);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn png_streams_original_bytes() {
+        let dir = test_dir("png-streams-original-bytes");
+
+        let path = temp_image(&dir, "keep.png", image::ImageFormat::Png);
+        let original = std::fs::read(&path).unwrap();
+        let (payload, format) = payload_for(&path).unwrap();
+        assert_eq!(format, FMT_PNG);
+        assert_eq!(payload, original);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
